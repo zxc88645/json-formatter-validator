@@ -2,10 +2,12 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, PointerEvent as ReactPointerEvent } from "react";
+import JsonCodeEditor from "./json-code-editor";
+import type { JsonCodeEditorHandle } from "./json-code-editor";
 
 const SAMPLE = `{
   "project": "Aurora",
-  "version": 3,
+  "version": 4,
   "active": true,
   "tags": ["design", "tools", "json"],
   "owner": {
@@ -29,6 +31,7 @@ type ViewMode = "code" | "tree";
 type Theme = "light" | "dark";
 type MobilePanel = "input" | "output";
 type TreeExpansion = "default" | "all" | "none";
+type TreeSelection = { path: string; value: unknown };
 
 type SavedWorkspace = {
   source: string;
@@ -101,6 +104,13 @@ function primitiveClass(value: unknown) {
   return "";
 }
 
+function childPath(parent: string, key: string, isArray: boolean) {
+  if (isArray) return `${parent}[${key}]`;
+  return /^[A-Za-z_$][\w$]*$/.test(key)
+    ? `${parent}.${key}`
+    : `${parent}[${JSON.stringify(key)}]`;
+}
+
 function Primitive({ value }: { value: unknown }) {
   const label = typeof value === "string" ? `"${value}"` : String(value);
   return <span className={primitiveClass(value)}>{label}</span>;
@@ -109,18 +119,34 @@ function Primitive({ value }: { value: unknown }) {
 function JsonTree({
   value,
   name,
+  path = "$",
   depth = 0,
   expansion,
+  selectedPath,
+  onSelect,
 }: {
   value: unknown;
   name?: string;
+  path?: string;
   depth?: number;
   expansion: TreeExpansion;
+  selectedPath: string;
+  onSelect: (selection: TreeSelection) => void;
 }) {
   const isContainer = value !== null && typeof value === "object";
+  const selected = selectedPath === path;
   if (!isContainer) {
     return (
-      <div className="tree-row" style={{ "--depth": depth } as CSSProperties}>
+      <div
+        className={`tree-row tree-value-row ${selected ? "selected" : ""}`}
+        style={{ "--depth": depth } as CSSProperties}
+        role="button"
+        tabIndex={0}
+        onClick={() => onSelect({ path, value })}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" || event.key === " ") onSelect({ path, value });
+        }}
+      >
         {name !== undefined && <span className="tree-key">{name}</span>}
         {name !== undefined && <span className="tree-separator">:</span>}
         <Primitive value={value} />
@@ -134,7 +160,11 @@ function JsonTree({
 
   return (
     <details className="tree-branch" open={defaultOpen}>
-      <summary className="tree-row" style={{ "--depth": depth } as CSSProperties}>
+      <summary
+        className={`tree-row ${selected ? "selected" : ""}`}
+        style={{ "--depth": depth } as CSSProperties}
+        onClick={() => onSelect({ path, value })}
+      >
         {name !== undefined && <span className="tree-key">{name}</span>}
         {name !== undefined && <span className="tree-separator">:</span>}
         <span className="tree-summary">
@@ -146,8 +176,11 @@ function JsonTree({
           key={key}
           name={isArray ? `[${key}]` : key}
           value={item}
+          path={childPath(path, key, isArray)}
           depth={depth + 1}
           expansion={expansion}
+          selectedPath={selectedPath}
+          onSelect={onSelect}
         />
       ))}
     </details>
@@ -167,19 +200,16 @@ export default function Home() {
   const [theme, setTheme] = useState<Theme>("light");
   const [mobilePanel, setMobilePanel] = useState<MobilePanel>("input");
   const [paneWidth, setPaneWidth] = useState(50);
-  const [searchOpen, setSearchOpen] = useState(false);
-  const [findQuery, setFindQuery] = useState("");
-  const [replaceValue, setReplaceValue] = useState("");
-  const [currentMatch, setCurrentMatch] = useState(-1);
   const [treeExpansion, setTreeExpansion] = useState<TreeExpansion>("default");
   const [treeRevision, setTreeRevision] = useState(0);
+  const [treeSelection, setTreeSelection] = useState<TreeSelection | null>(null);
   const [copied, setCopied] = useState(false);
+  const [toast, setToast] = useState("");
+  const [dragActive, setDragActive] = useState(false);
   const [restored, setRestored] = useState(false);
 
-  const inputRef = useRef<HTMLTextAreaElement>(null);
-  const lineNumbersRef = useRef<HTMLDivElement>(null);
+  const editorRef = useRef<JsonCodeEditorHandle>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const findInputRef = useRef<HTMLInputElement>(null);
   const editorsRef = useRef<HTMLDivElement>(null);
   const result = useMemo(() => validate(source), [source]);
 
@@ -197,74 +227,68 @@ export default function Home() {
     keys: parsed === null ? 0 : countKeys(parsed),
   }), [parsed, source]);
 
-  const matchCount = useMemo(() => {
-    if (!findQuery) return 0;
-    let count = 0;
-    let cursor = 0;
-    const haystack = source.toLocaleLowerCase();
-    const needle = findQuery.toLocaleLowerCase();
-    while ((cursor = haystack.indexOf(needle, cursor)) !== -1) {
-      count += 1;
-      cursor += Math.max(needle.length, 1);
-    }
-    return count;
-  }, [findQuery, source]);
+  const showToast = useCallback((message: string) => {
+    setToast(message);
+    window.setTimeout(() => setToast(""), 1700);
+  }, []);
 
   const format = useCallback(() => {
     if (!result.valid) return;
     setOutput(formatJson(source, indent, sortKeys));
     setMobilePanel("output");
-  }, [indent, result.valid, sortKeys, source]);
+    showToast("JSON 已格式化");
+  }, [indent, result.valid, showToast, sortKeys, source]);
 
   useEffect(() => {
-    try {
-      const autoSavePreference = localStorage.getItem(AUTOSAVE_KEY);
-      if (autoSavePreference !== null) setAutoSave(autoSavePreference === "true");
-      const saved = localStorage.getItem(STORAGE_KEY);
-      if (saved) {
-        const workspace = JSON.parse(saved) as Partial<SavedWorkspace>;
-        if (typeof workspace.source === "string") setSource(workspace.source);
-        if (typeof workspace.fileName === "string") setFileName(workspace.fileName);
-        if (["2", "4", "tab"].includes(workspace.indent ?? "")) setIndent(workspace.indent!);
-        if (typeof workspace.sortKeys === "boolean") setSortKeys(workspace.sortKeys);
-        if (typeof workspace.autoSync === "boolean") setAutoSync(workspace.autoSync);
-        if (workspace.viewMode === "code" || workspace.viewMode === "tree") setViewMode(workspace.viewMode);
-        if (workspace.theme === "light" || workspace.theme === "dark") setTheme(workspace.theme);
-        if (typeof workspace.paneWidth === "number") setPaneWidth(Math.min(72, Math.max(28, workspace.paneWidth)));
-        setSaveState("已還原本機內容");
-      } else if (window.matchMedia("(prefers-color-scheme: dark)").matches) {
-        setTheme("dark");
+    const timer = window.setTimeout(() => {
+      try {
+        const autoSavePreference = localStorage.getItem(AUTOSAVE_KEY);
+        if (autoSavePreference !== null) setAutoSave(autoSavePreference === "true");
+        const saved = localStorage.getItem(STORAGE_KEY);
+        if (saved) {
+          const workspace = JSON.parse(saved) as Partial<SavedWorkspace>;
+          if (typeof workspace.source === "string") setSource(workspace.source);
+          if (typeof workspace.fileName === "string") setFileName(workspace.fileName);
+          if (["2", "4", "tab"].includes(workspace.indent ?? "")) setIndent(workspace.indent!);
+          if (typeof workspace.sortKeys === "boolean") setSortKeys(workspace.sortKeys);
+          if (typeof workspace.autoSync === "boolean") setAutoSync(workspace.autoSync);
+          if (workspace.viewMode === "code" || workspace.viewMode === "tree") setViewMode(workspace.viewMode);
+          if (workspace.theme === "light" || workspace.theme === "dark") setTheme(workspace.theme);
+          if (typeof workspace.paneWidth === "number") setPaneWidth(Math.min(72, Math.max(28, workspace.paneWidth)));
+          setSaveState("已還原本機內容");
+        } else if (window.matchMedia("(prefers-color-scheme: dark)").matches) {
+          setTheme("dark");
+        }
+      } catch {
+        setSaveState("無法讀取本機內容");
+      } finally {
+        setRestored(true);
       }
-    } catch {
-      setSaveState("無法讀取本機內容");
-    } finally {
-      setRestored(true);
-    }
+    }, 0);
+    return () => window.clearTimeout(timer);
   }, []);
 
   useEffect(() => {
-    if (autoSync && result.valid) setOutput(formatJson(source, indent, sortKeys));
+    if (!autoSync || !result.valid) return;
+    const timer = window.setTimeout(() => setOutput(formatJson(source, indent, sortKeys)), 0);
+    return () => window.clearTimeout(timer);
   }, [autoSync, indent, result.valid, sortKeys, source]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => setTreeSelection(null), 0);
+    return () => window.clearTimeout(timer);
+  }, [output]);
 
   useEffect(() => {
     if (!restored) return;
     localStorage.setItem(AUTOSAVE_KEY, String(autoSave));
     if (!autoSave) {
-      setSaveState("自動儲存已關閉");
-      return;
+      const offTimer = window.setTimeout(() => setSaveState("自動儲存已關閉"), 0);
+      return () => window.clearTimeout(offTimer);
     }
-    setSaveState("儲存中…");
+    const savingTimer = window.setTimeout(() => setSaveState("儲存中…"), 0);
     const timer = window.setTimeout(() => {
-      const workspace: SavedWorkspace = {
-        source,
-        fileName,
-        indent,
-        sortKeys,
-        autoSync,
-        viewMode,
-        theme,
-        paneWidth,
-      };
+      const workspace: SavedWorkspace = { source, fileName, indent, sortKeys, autoSync, viewMode, theme, paneWidth };
       try {
         localStorage.setItem(STORAGE_KEY, JSON.stringify(workspace));
         setSaveState("已儲存在本機");
@@ -272,55 +296,11 @@ export default function Home() {
         setSaveState("本機空間不足");
       }
     }, 450);
-    return () => window.clearTimeout(timer);
+    return () => {
+      window.clearTimeout(savingTimer);
+      window.clearTimeout(timer);
+    };
   }, [autoSave, autoSync, fileName, indent, paneWidth, restored, sortKeys, source, theme, viewMode]);
-
-  useEffect(() => {
-    if (searchOpen) window.setTimeout(() => findInputRef.current?.focus(), 0);
-  }, [searchOpen]);
-
-  const findNext = useCallback((direction: 1 | -1 = 1) => {
-    if (!findQuery || !source) return;
-    const textarea = inputRef.current;
-    const haystack = source.toLocaleLowerCase();
-    const needle = findQuery.toLocaleLowerCase();
-    const anchor = direction === 1
-      ? (textarea?.selectionEnd ?? currentMatch + needle.length)
-      : Math.max(0, (textarea?.selectionStart ?? currentMatch) - 1);
-    let index = direction === 1
-      ? haystack.indexOf(needle, anchor)
-      : haystack.lastIndexOf(needle, anchor);
-    if (index === -1) index = direction === 1 ? haystack.indexOf(needle) : haystack.lastIndexOf(needle);
-    if (index === -1) return;
-    setCurrentMatch(index);
-    textarea?.focus();
-    textarea?.setSelectionRange(index, index + findQuery.length);
-  }, [currentMatch, findQuery, source]);
-
-  const replaceCurrent = () => {
-    const textarea = inputRef.current;
-    if (!textarea || !findQuery) return;
-    const { selectionStart, selectionEnd } = textarea;
-    const selected = source.slice(selectionStart, selectionEnd);
-    if (selected.toLocaleLowerCase() !== findQuery.toLocaleLowerCase()) {
-      findNext(1);
-      return;
-    }
-    const nextSource = `${source.slice(0, selectionStart)}${replaceValue}${source.slice(selectionEnd)}`;
-    setSource(nextSource);
-    window.requestAnimationFrame(() => {
-      const nextPosition = selectionStart + replaceValue.length;
-      textarea.focus();
-      textarea.setSelectionRange(nextPosition, nextPosition);
-    });
-  };
-
-  const replaceAll = () => {
-    if (!findQuery) return;
-    const escaped = findQuery.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    setSource(source.replace(new RegExp(escaped, "gi"), replaceValue));
-    setCurrentMatch(-1);
-  };
 
   const minify = () => {
     if (!result.valid) return;
@@ -328,11 +308,18 @@ export default function Home() {
     setOutput(JSON.stringify(value));
     setViewMode("code");
     setMobilePanel("output");
+    showToast("JSON 已壓縮");
+  };
+
+  const copyText = async (text: string, message: string) => {
+    await navigator.clipboard.writeText(text);
+    showToast(message);
   };
 
   const copyOutput = async () => {
     await navigator.clipboard.writeText(output);
     setCopied(true);
+    showToast("已複製格式化結果");
     window.setTimeout(() => setCopied(false), 1500);
   };
 
@@ -343,6 +330,7 @@ export default function Home() {
     anchor.download = fileName;
     anchor.click();
     URL.revokeObjectURL(url);
+    showToast("JSON 檔案已下載");
   };
 
   const openFile = async (file?: File) => {
@@ -351,17 +339,13 @@ export default function Home() {
     setSource(text);
     setFileName(file.name.toLowerCase().endsWith(".json") ? file.name : `${file.name}.json`);
     setMobilePanel("input");
+    setDragActive(false);
+    showToast(`已開啟 ${file.name}`);
   };
 
   const focusError = () => {
     if (result.position === undefined) return;
-    const textarea = inputRef.current;
-    textarea?.focus();
-    textarea?.setSelectionRange(result.position, result.position + 1);
-    if (textarea && result.line) {
-      textarea.scrollTop = Math.max(0, (result.line - 1) * 19.8 - textarea.clientHeight / 2);
-      if (lineNumbersRef.current) lineNumbersRef.current.scrollTop = textarea.scrollTop;
-    }
+    editorRef.current?.jumpTo(result.position);
   };
 
   const changeTreeExpansion = (expansion: TreeExpansion) => {
@@ -387,6 +371,15 @@ export default function Home() {
     window.addEventListener("pointerup", stop);
   };
 
+  const selectedPath = treeSelection?.path ?? "$";
+  const selectedValue = treeSelection?.value ?? outputParsed;
+  const selectedDisplayValue = typeof selectedValue === "string"
+    ? selectedValue
+    : selectedValue === undefined
+      ? ""
+      : JSON.stringify(selectedValue);
+  const selectedJson = selectedValue === undefined ? "" : JSON.stringify(selectedValue, null, 2);
+
   return (
     <main
       className="app-shell"
@@ -399,11 +392,7 @@ export default function Home() {
         }
         if (command && event.key.toLocaleLowerCase() === "f") {
           event.preventDefault();
-          setSearchOpen(true);
-        }
-        if (command && event.key.toLocaleLowerCase() === "h") {
-          event.preventDefault();
-          setSearchOpen(true);
+          editorRef.current?.openSearch();
         }
       }}
     >
@@ -415,12 +404,7 @@ export default function Home() {
         <div className="topbar-meta">
           <span className="save-indicator" title={saveState}><span />{saveState}</span>
           <span className="local-badge"><span />Local only</span>
-          <button
-            className="theme-button"
-            type="button"
-            onClick={() => setTheme((current) => current === "light" ? "dark" : "light")}
-            aria-label={theme === "light" ? "切換深色模式" : "切換淺色模式"}
-          >
+          <button className="theme-button" type="button" onClick={() => setTheme((current) => current === "light" ? "dark" : "light")} aria-label={theme === "light" ? "切換深色模式" : "切換淺色模式"}>
             {theme === "light" ? "深色" : "淺色"}
           </button>
         </div>
@@ -428,25 +412,35 @@ export default function Home() {
 
       <section className="tool-heading" aria-labelledby="page-title">
         <div><h1 id="page-title">JSON Formatter &amp; Validator</h1><p>格式化、驗證與檢視 JSON，資料不離開瀏覽器。</p></div>
-        <div className={`document-status ${result.valid ? "is-valid" : "is-error"}`}>
-          <span>{result.valid ? "✓" : "!"}</span><strong>{result.valid ? "VALID JSON" : "INVALID JSON"}</strong>
-        </div>
+        <div className={`document-status ${result.valid ? "is-valid" : "is-error"}`}><span>{result.valid ? "✓" : "!"}</span><strong>{result.valid ? "VALID JSON" : "INVALID JSON"}</strong></div>
       </section>
 
-      <section id="workspace" className="workspace" aria-label="JSON 編輯工作區">
+      <section
+        id="workspace"
+        className={`workspace ${dragActive ? "is-dragging" : ""}`}
+        aria-label="JSON 編輯工作區"
+        onDragEnter={(event) => { event.preventDefault(); setDragActive(true); }}
+        onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = "copy"; }}
+        onDragLeave={(event) => {
+          if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDragActive(false);
+        }}
+        onDrop={(event) => {
+          event.preventDefault();
+          openFile(event.dataTransfer.files?.[0]);
+        }}
+      >
+        {dragActive && <div className="drop-overlay"><strong>放開以開啟 JSON</strong><span>內容只會在瀏覽器本機讀取</span></div>}
         <nav className="toolbar" aria-label="編輯工具">
           <div className="toolbar-group file-tools">
             <button className="ghost-button" type="button" onClick={() => { setSource(""); setOutput(""); setFileName("untitled.json"); setMobilePanel("input"); }}>新增</button>
             <button className="ghost-button" type="button" onClick={() => fileInputRef.current?.click()}>開啟檔案</button>
             <input ref={fileInputRef} className="visually-hidden" type="file" accept=".json,application/json,text/plain" onChange={(event) => openFile(event.target.files?.[0])} />
-            <button className="ghost-button search-toggle" type="button" onClick={() => setSearchOpen((open) => !open)}>搜尋／取代</button>
+            <button className="ghost-button" type="button" onClick={() => editorRef.current?.openSearch()}>搜尋／取代</button>
             <span className="file-name" title={fileName}>{fileName}</span>
           </div>
           <div className="toolbar-group format-tools">
             <label className="compact-field"><span>縮排</span>
-              <select value={indent} onChange={(event) => setIndent(event.target.value)} aria-label="縮排方式">
-                <option value="2">2 spaces</option><option value="4">4 spaces</option><option value="tab">Tab</option>
-              </select>
+              <select value={indent} onChange={(event) => setIndent(event.target.value)} aria-label="縮排方式"><option value="2">2 spaces</option><option value="4">4 spaces</option><option value="tab">Tab</option></select>
             </label>
             <label className="check-label"><input type="checkbox" checked={sortKeys} onChange={(event) => setSortKeys(event.target.checked)} />排序鍵值</label>
             <label className="check-label"><input type="checkbox" checked={autoSync} onChange={(event) => setAutoSync(event.target.checked)} />即時同步</label>
@@ -464,53 +458,19 @@ export default function Home() {
           <button role="tab" aria-selected={mobilePanel === "output"} className={mobilePanel === "output" ? "active" : ""} type="button" onClick={() => setMobilePanel("output")}>結果</button>
         </div>
 
-        <div
-          ref={editorsRef}
-          className="editors"
-          style={{ "--left-pane": `${paneWidth}fr`, "--right-pane": `${100 - paneWidth}fr` } as CSSProperties}
-        >
+        <div ref={editorsRef} className="editors" style={{ "--left-pane": `${paneWidth}fr`, "--right-pane": `${100 - paneWidth}fr` } as CSSProperties}>
           <article className={`editor-panel input-panel ${mobilePanel !== "input" ? "mobile-inactive" : ""}`}>
             <div className="panel-header">
-              <div className="panel-title"><span className="panel-index">01</span><h2>文字編輯器</h2></div>
-              <div className="panel-actions"><span className="mini-stat">{stats.lines} lines</span><button className="text-button" type="button" onClick={() => setSource("")}>清除</button></div>
+              <div className="panel-title"><span className="panel-index">01</span><h2>CodeMirror 編輯器</h2></div>
+              <div className="panel-actions">
+                <span className="mini-stat">{stats.lines} lines</span>
+                <button className="text-button" type="button" onClick={() => editorRef.current?.undo()} title="復原（⌘Z）">Undo</button>
+                <button className="text-button" type="button" onClick={() => editorRef.current?.redo()} title="重做（⌘⇧Z）">Redo</button>
+                <button className="text-button" type="button" onClick={() => setSource("")}>清除</button>
+              </div>
             </div>
-            {searchOpen && (
-              <div className="search-panel">
-                <div className="search-field">
-                  <input
-                    ref={findInputRef}
-                    value={findQuery}
-                    onChange={(event) => { setFindQuery(event.target.value); setCurrentMatch(-1); }}
-                    onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); findNext(event.shiftKey ? -1 : 1); } }}
-                    placeholder="搜尋"
-                    aria-label="搜尋文字"
-                  />
-                  <span>{matchCount ? `${matchCount} 筆` : "無結果"}</span>
-                </div>
-                <input value={replaceValue} onChange={(event) => setReplaceValue(event.target.value)} placeholder="取代為" aria-label="取代文字" />
-                <button type="button" onClick={() => findNext(-1)} disabled={!matchCount} aria-label="上一筆">↑</button>
-                <button type="button" onClick={() => findNext(1)} disabled={!matchCount} aria-label="下一筆">↓</button>
-                <button type="button" onClick={replaceCurrent} disabled={!matchCount}>取代</button>
-                <button type="button" onClick={replaceAll} disabled={!matchCount}>全部</button>
-                <button className="search-close" type="button" onClick={() => setSearchOpen(false)} aria-label="關閉搜尋">×</button>
-              </div>
-            )}
             <div className="code-wrap">
-              <div ref={lineNumbersRef} className="line-numbers" aria-hidden="true">
-                {source.split("\n").map((_, index) => (
-                  <span key={index} className={result.line === index + 1 && !result.valid ? "error-line" : ""}>{index + 1}</span>
-                ))}
-              </div>
-              <textarea
-                ref={inputRef}
-                aria-label="JSON 輸入"
-                aria-invalid={!result.valid}
-                value={source}
-                onChange={(event) => setSource(event.target.value)}
-                onScroll={(event) => { if (lineNumbersRef.current) lineNumbersRef.current.scrollTop = event.currentTarget.scrollTop; }}
-                spellCheck={false}
-                placeholder={'貼上 JSON，例如 { "status": "ok" }'}
-              />
+              <JsonCodeEditor ref={editorRef} value={source} onChange={setSource} validation={result} theme={theme} />
             </div>
             <button className={`validation ${result.valid ? "is-valid" : "is-error"}`} type="button" onClick={focusError} disabled={result.position === undefined}>
               <span className="status-icon">{result.valid ? "✓" : "!"}</span>
@@ -519,55 +479,46 @@ export default function Home() {
             </button>
           </article>
 
-          <div
-            className="pane-divider"
-            role="separator"
-            aria-label="調整編輯器面板寬度"
-            aria-orientation="vertical"
-            aria-valuemin={28}
-            aria-valuemax={72}
-            aria-valuenow={Math.round(paneWidth)}
-            tabIndex={0}
-            onPointerDown={beginResize}
+          <div className="pane-divider" role="separator" aria-label="調整編輯器面板寬度" aria-orientation="vertical" aria-valuemin={28} aria-valuemax={72} aria-valuenow={Math.round(paneWidth)} tabIndex={0} onPointerDown={beginResize}
             onKeyDown={(event) => {
               if (event.key === "ArrowLeft") setPaneWidth((width) => Math.max(28, width - 2));
               if (event.key === "ArrowRight") setPaneWidth((width) => Math.min(72, width + 2));
               if (event.key === "Home") setPaneWidth(28);
               if (event.key === "End") setPaneWidth(72);
-            }}
-          ><span /></div>
+            }}><span /></div>
 
           <article className={`editor-panel output-panel ${mobilePanel !== "output" ? "mobile-inactive" : ""}`}>
             <div className="panel-header">
               <div className="panel-title"><span className="panel-index">02</span><h2>結果</h2></div>
               <div className="panel-actions">
-                {viewMode === "tree" && (
-                  <div className="tree-actions">
-                    <button type="button" onClick={() => changeTreeExpansion("all")}>全部展開</button>
-                    <button type="button" onClick={() => changeTreeExpansion("none")}>全部收合</button>
-                  </div>
-                )}
-                <div className="view-switch" aria-label="結果檢視模式">
-                  <button className={viewMode === "code" ? "active" : ""} type="button" onClick={() => setViewMode("code")}>程式碼</button>
-                  <button className={viewMode === "tree" ? "active" : ""} type="button" onClick={() => setViewMode("tree")} disabled={outputParsed === null}>樹狀</button>
-                </div>
+                {viewMode === "tree" && <div className="tree-actions"><button type="button" onClick={() => changeTreeExpansion("all")}>全部展開</button><button type="button" onClick={() => changeTreeExpansion("none")}>全部收合</button></div>}
+                <div className="view-switch" aria-label="結果檢視模式"><button className={viewMode === "code" ? "active" : ""} type="button" onClick={() => setViewMode("code")}>程式碼</button><button className={viewMode === "tree" ? "active" : ""} type="button" onClick={() => setViewMode("tree")} disabled={outputParsed === null}>樹狀</button></div>
                 <button className="text-button" type="button" onClick={copyOutput} disabled={!output}>{copied ? "已複製" : "複製"}</button>
                 <button className="text-button" type="button" onClick={download} disabled={!output}>下載</button>
               </div>
             </div>
             {viewMode === "tree" && outputParsed !== null ? (
-              <div className="tree-view" key={`${treeExpansion}-${treeRevision}`}><JsonTree value={outputParsed} expansion={treeExpansion} /></div>
+              <>
+                <div className="tree-contextbar">
+                  <code title={selectedPath}>{selectedPath}</code>
+                  <button type="button" onClick={() => copyText(selectedPath, "已複製 JSONPath")}>複製路徑</button>
+                  <button type="button" onClick={() => copyText(selectedDisplayValue, "已複製節點值")}>複製值</button>
+                  <button type="button" onClick={() => copyText(selectedJson, "已複製節點 JSON")}>複製 JSON</button>
+                </div>
+                <div className="tree-view" key={`${treeExpansion}-${treeRevision}`}>
+                  <JsonTree value={outputParsed} expansion={treeExpansion} selectedPath={selectedPath} onSelect={setTreeSelection} />
+                </div>
+              </>
             ) : (
               <pre className="output-code" tabIndex={0}><code>{output || "格式化後的 JSON 會顯示在這裡。"}</code></pre>
             )}
-            <div className="stats" aria-label="JSON 統計資訊">
-              <span><strong>{stats.keys}</strong> keys</span><span><strong>{stats.chars.toLocaleString()}</strong> bytes</span><span>UTF-8</span><span className="stats-spacer" /><span>{autoSync ? "AUTO SYNC ON" : "MANUAL"}</span>
-            </div>
+            <div className="stats" aria-label="JSON 統計資訊"><span><strong>{stats.keys}</strong> keys</span><span><strong>{stats.chars.toLocaleString()}</strong> bytes</span><span>UTF-8</span><span className="stats-spacer" /><span>{autoSync ? "AUTO SYNC ON" : "MANUAL"}</span></div>
           </article>
         </div>
       </section>
 
-      <footer><span>所有處理與儲存皆在本機完成</span><span>JSON TOOL · v3</span></footer>
+      <footer><span>所有處理與儲存皆在本機完成</span><span>JSON TOOL · v4</span></footer>
+      {toast && <div className="toast" role="status">{toast}</div>}
     </main>
   );
 }

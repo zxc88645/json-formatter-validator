@@ -6,10 +6,12 @@
 
 ## 功能
 
-- JSON 即時驗證、錯誤行標記與定位
+- CodeMirror 6 編輯器：語法上色、括號配對、程式碼摺疊、搜尋取代
+- Undo／Redo 與精確錯誤標記
 - 格式化、壓縮、排序鍵值、複製與下載
 - 程式碼與可展開樹狀檢視
-- 搜尋與取代
+- JSONPath Breadcrumb、節點路徑／值／JSON 複製
+- 拖放或選取 JSON 檔案
 - 可拖曳調整雙欄寬度
 - 手機版輸入／結果分頁
 - 深色模式
@@ -19,6 +21,7 @@
 
 - Vinext / React
 - TypeScript
+- CodeMirror 6
 - Cloudflare Workers 相容輸出
 - OpenAI Sites 部署
 
