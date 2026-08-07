@@ -69,6 +69,7 @@ export type JsonCodeEditorHandle = {
 
 type JsonCodeEditorProps = {
   onChange: (value: string) => void;
+  readOnly?: boolean;
   theme: "light" | "dark";
   validation: EditorValidation;
   value: string;
@@ -88,12 +89,13 @@ const lightTheme = EditorView.theme({
 });
 
 const JsonCodeEditor = forwardRef<JsonCodeEditorHandle, JsonCodeEditorProps>(
-  function JsonCodeEditor({ onChange, theme, validation, value }, ref) {
+  function JsonCodeEditor({ onChange, readOnly = false, theme, validation, value }, ref) {
     const hostRef = useRef<HTMLDivElement>(null);
     const viewRef = useRef<EditorView | null>(null);
     const onChangeRef = useRef(onChange);
     const initialValueRef = useRef(value);
     const initialThemeRef = useRef(theme);
+    const initialReadOnlyRef = useRef(readOnly);
     const themeCompartmentRef = useRef(new Compartment());
 
     useEffect(() => {
@@ -120,8 +122,9 @@ const JsonCodeEditor = forwardRef<JsonCodeEditorHandle, JsonCodeEditorProps>(
           closeBrackets(),
           syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
           json(),
-          lintGutter(),
-          linter(() => []),
+          initialReadOnlyRef.current ? [] : [lintGutter(), linter(() => [])],
+          EditorState.readOnly.of(initialReadOnlyRef.current),
+          EditorView.editable.of(!initialReadOnlyRef.current),
           keymap.of([
             indentWithTab,
             ...closeBracketsKeymap,
@@ -166,7 +169,7 @@ const JsonCodeEditor = forwardRef<JsonCodeEditorHandle, JsonCodeEditorProps>(
       if (!view) return;
       const length = view.state.doc.length;
       const position = Math.min(validation.position ?? 0, length);
-      const diagnostics = validation.valid
+      const diagnostics = readOnly || validation.valid
         ? []
         : [{
             from: position,
@@ -177,7 +180,7 @@ const JsonCodeEditor = forwardRef<JsonCodeEditorHandle, JsonCodeEditorProps>(
               : validation.message,
           }];
       view.dispatch(setDiagnostics(view.state, diagnostics));
-    }, [validation]);
+    }, [readOnly, validation]);
 
     useImperativeHandle(ref, () => ({
       closeSearch: () => {
@@ -209,7 +212,7 @@ const JsonCodeEditor = forwardRef<JsonCodeEditorHandle, JsonCodeEditorProps>(
       },
     }), []);
 
-    return <div className="code-editor" ref={hostRef} />;
+    return <div className={`code-editor ${readOnly ? "is-readonly" : ""}`} ref={hostRef} />;
   },
 );
 

@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { CSSProperties, PointerEvent as ReactPointerEvent } from "react";
+import type { CSSProperties, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent } from "react";
 import JsonCodeEditor from "./json-code-editor";
 import type { JsonCodeEditorHandle } from "./json-code-editor";
 
@@ -32,6 +32,7 @@ type Theme = "light" | "dark";
 type MobilePanel = "input" | "output";
 type TreeExpansion = "default" | "all" | "none";
 type TreeSelection = { path: string; value: unknown };
+type ContextMenuState = TreeSelection & { x: number; y: number };
 
 type SavedWorkspace = {
   source: string;
@@ -124,6 +125,7 @@ function JsonTree({
   expansion,
   selectedPath,
   onSelect,
+  onContextMenu,
 }: {
   value: unknown;
   name?: string;
@@ -132,6 +134,7 @@ function JsonTree({
   expansion: TreeExpansion;
   selectedPath: string;
   onSelect: (selection: TreeSelection) => void;
+  onContextMenu: (event: ReactMouseEvent, selection: TreeSelection) => void;
 }) {
   const isContainer = value !== null && typeof value === "object";
   const selected = selectedPath === path;
@@ -143,6 +146,7 @@ function JsonTree({
         role="button"
         tabIndex={0}
         onClick={() => onSelect({ path, value })}
+        onContextMenu={(event) => onContextMenu(event, { path, value })}
         onKeyDown={(event) => {
           if (event.key === "Enter" || event.key === " ") onSelect({ path, value });
         }}
@@ -164,6 +168,7 @@ function JsonTree({
         className={`tree-row ${selected ? "selected" : ""}`}
         style={{ "--depth": depth } as CSSProperties}
         onClick={() => onSelect({ path, value })}
+        onContextMenu={(event) => onContextMenu(event, { path, value })}
       >
         {name !== undefined && <span className="tree-key">{name}</span>}
         {name !== undefined && <span className="tree-separator">:</span>}
@@ -181,6 +186,7 @@ function JsonTree({
           expansion={expansion}
           selectedPath={selectedPath}
           onSelect={onSelect}
+          onContextMenu={onContextMenu}
         />
       ))}
     </details>
@@ -207,10 +213,15 @@ export default function Home() {
   const [toast, setToast] = useState("");
   const [dragActive, setDragActive] = useState(false);
   const [restored, setRestored] = useState(false);
+  const [commandOpen, setCommandOpen] = useState(false);
+  const [commandQuery, setCommandQuery] = useState("");
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
 
   const editorRef = useRef<JsonCodeEditorHandle>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const editorsRef = useRef<HTMLDivElement>(null);
+  const commandInputRef = useRef<HTMLInputElement>(null);
   const result = useMemo(() => validate(source), [source]);
 
   const parsed = useMemo(() => {
@@ -238,6 +249,14 @@ export default function Home() {
     setMobilePanel("output");
     showToast("JSON 已格式化");
   }, [indent, result.valid, showToast, sortKeys, source]);
+
+  const newDocument = useCallback(() => {
+    setSource("");
+    setOutput("");
+    setFileName("untitled.json");
+    setMobilePanel("input");
+    window.setTimeout(() => editorRef.current?.focus(), 0);
+  }, []);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -301,6 +320,42 @@ export default function Home() {
       window.clearTimeout(timer);
     };
   }, [autoSave, autoSync, fileName, indent, paneWidth, restored, sortKeys, source, theme, viewMode]);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      const command = event.metaKey || event.ctrlKey;
+      if (command && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        setCommandOpen(true);
+        setCommandQuery("");
+      }
+      if (command && event.key === "/") {
+        event.preventDefault();
+        setShortcutsOpen(true);
+      }
+      if (event.key === "Escape") {
+        setCommandOpen(false);
+        setShortcutsOpen(false);
+        setContextMenu(null);
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, []);
+
+  useEffect(() => {
+    if (commandOpen) window.setTimeout(() => commandInputRef.current?.focus(), 0);
+  }, [commandOpen]);
+
+  useEffect(() => {
+    const close = () => setContextMenu(null);
+    window.addEventListener("click", close);
+    window.addEventListener("resize", close);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("resize", close);
+    };
+  }, []);
 
   const minify = () => {
     if (!result.valid) return;
@@ -379,6 +434,33 @@ export default function Home() {
       ? ""
       : JSON.stringify(selectedValue);
   const selectedJson = selectedValue === undefined ? "" : JSON.stringify(selectedValue, null, 2);
+  const outputValidation = useMemo<Validation>(() => ({ valid: true, message: "唯讀結果" }), []);
+
+  const handleCommandClick = (event: ReactMouseEvent<HTMLButtonElement>) => {
+    const action = event.currentTarget.dataset.action;
+    setCommandOpen(false);
+    setCommandQuery("");
+    if (action === "format") format();
+    if (action === "minify") minify();
+    if (action === "search") editorRef.current?.openSearch();
+    if (action === "open") fileInputRef.current?.click();
+    if (action === "new") newDocument();
+    if (action === "copy") copyOutput();
+    if (action === "download") download();
+    if (action === "theme") setTheme((current) => current === "light" ? "dark" : "light");
+  };
+
+  const commands = [
+    { label: "格式化 JSON", hint: "⌘ Enter", action: "format", disabled: !result.valid },
+    { label: "壓縮 JSON", hint: "", action: "minify", disabled: !result.valid },
+    { label: "搜尋／取代", hint: "⌘ F", action: "search" },
+    { label: "開啟 JSON 檔案", hint: "", action: "open" },
+    { label: "建立新文件", hint: "", action: "new" },
+    { label: "複製結果", hint: "", action: "copy", disabled: !output },
+    { label: "下載結果", hint: "", action: "download", disabled: !output },
+    { label: theme === "light" ? "切換深色模式" : "切換淺色模式", hint: "", action: "theme" },
+  ];
+  const filteredCommands = commands.filter((command) => command.label.toLowerCase().includes(commandQuery.trim().toLowerCase()));
 
   return (
     <main
@@ -404,6 +486,7 @@ export default function Home() {
         <div className="topbar-meta">
           <span className="save-indicator" title={saveState}><span />{saveState}</span>
           <span className="local-badge"><span />Local only</span>
+          <button className="command-trigger" type="button" onClick={() => setCommandOpen(true)} aria-label="開啟命令面板">命令 <kbd>⌘K</kbd></button>
           <button className="theme-button" type="button" onClick={() => setTheme((current) => current === "light" ? "dark" : "light")} aria-label={theme === "light" ? "切換深色模式" : "切換淺色模式"}>
             {theme === "light" ? "深色" : "淺色"}
           </button>
@@ -432,10 +515,8 @@ export default function Home() {
         {dragActive && <div className="drop-overlay"><strong>放開以開啟 JSON</strong><span>內容只會在瀏覽器本機讀取</span></div>}
         <nav className="toolbar" aria-label="編輯工具">
           <div className="toolbar-group file-tools">
-            <button className="ghost-button" type="button" onClick={() => { setSource(""); setOutput(""); setFileName("untitled.json"); setMobilePanel("input"); }}>新增</button>
             <button className="ghost-button" type="button" onClick={() => fileInputRef.current?.click()}>開啟檔案</button>
             <input ref={fileInputRef} className="visually-hidden" type="file" accept=".json,application/json,text/plain" onChange={(event) => openFile(event.target.files?.[0])} />
-            <button className="ghost-button" type="button" onClick={() => editorRef.current?.openSearch()}>搜尋／取代</button>
             <span className="file-name" title={fileName}>{fileName}</span>
           </div>
           <div className="toolbar-group format-tools">
@@ -444,11 +525,19 @@ export default function Home() {
             </label>
             <label className="check-label"><input type="checkbox" checked={sortKeys} onChange={(event) => setSortKeys(event.target.checked)} />排序鍵值</label>
             <label className="check-label"><input type="checkbox" checked={autoSync} onChange={(event) => setAutoSync(event.target.checked)} />即時同步</label>
-            <label className="check-label"><input type="checkbox" checked={autoSave} onChange={(event) => setAutoSave(event.target.checked)} />自動儲存</label>
           </div>
           <div className="toolbar-actions">
-            <button className="ghost-button" type="button" onClick={() => { setSource(SAMPLE); setOutput(SAMPLE); setFileName("sample.json"); }}>載入範例</button>
             <button className="ghost-button" type="button" onClick={minify} disabled={!result.valid}>壓縮</button>
+            <details className="more-menu">
+              <summary>更多</summary>
+              <div className="more-menu-popover">
+                <button type="button" onClick={() => editorRef.current?.openSearch()}>搜尋／取代 <span>⌘F</span></button>
+                <button type="button" onClick={newDocument}>建立新文件</button>
+                <button type="button" onClick={() => { setSource(SAMPLE); setOutput(SAMPLE); setFileName("sample.json"); }}>載入範例</button>
+                <label><input type="checkbox" checked={autoSave} onChange={(event) => setAutoSave(event.target.checked)} />本機自動儲存</label>
+                <button type="button" onClick={() => setShortcutsOpen(true)}>鍵盤快捷鍵 <span>⌘/</span></button>
+              </div>
+            </details>
             <button className="primary-button" type="button" onClick={format} disabled={!result.valid}>格式化 <kbd>⌘↵</kbd></button>
           </div>
         </nav>
@@ -471,6 +560,7 @@ export default function Home() {
             </div>
             <div className="code-wrap">
               <JsonCodeEditor ref={editorRef} value={source} onChange={setSource} validation={result} theme={theme} />
+              {!source && <button className="empty-editor" type="button" onClick={() => fileInputRef.current?.click()}><strong>貼上或開啟 JSON</strong><span>也可以將 .json 檔案拖放到工作區</span></button>}
             </div>
             <button className={`validation ${result.valid ? "is-valid" : "is-error"}`} type="button" onClick={focusError} disabled={result.position === undefined}>
               <span className="status-icon">{result.valid ? "✓" : "!"}</span>
@@ -506,11 +596,13 @@ export default function Home() {
                   <button type="button" onClick={() => copyText(selectedJson, "已複製節點 JSON")}>複製 JSON</button>
                 </div>
                 <div className="tree-view" key={`${treeExpansion}-${treeRevision}`}>
-                  <JsonTree value={outputParsed} expansion={treeExpansion} selectedPath={selectedPath} onSelect={setTreeSelection} />
+                  <JsonTree value={outputParsed} expansion={treeExpansion} selectedPath={selectedPath} onSelect={setTreeSelection} onContextMenu={(event, selection) => { event.preventDefault(); setTreeSelection(selection); setContextMenu({ ...selection, x: event.clientX, y: event.clientY }); }} />
                 </div>
               </>
             ) : (
-              <pre className="output-code" tabIndex={0}><code>{output || "格式化後的 JSON 會顯示在這裡。"}</code></pre>
+              <div className="output-code-editor">
+                {output ? <JsonCodeEditor value={output} onChange={() => undefined} validation={outputValidation} theme={theme} readOnly /> : <div className="output-empty"><strong>尚無結果</strong><span>輸入有效 JSON 後，結果會自動顯示。</span></div>}
+              </div>
             )}
             <div className="stats" aria-label="JSON 統計資訊"><span><strong>{stats.keys}</strong> keys</span><span><strong>{stats.chars.toLocaleString()}</strong> bytes</span><span>UTF-8</span><span className="stats-spacer" /><span>{autoSync ? "AUTO SYNC ON" : "MANUAL"}</span></div>
           </article>
@@ -518,6 +610,13 @@ export default function Home() {
       </section>
 
       <footer><span>所有處理與儲存皆在本機完成</span><span>JSON TOOL · v4</span></footer>
+      {commandOpen && <div className="modal-backdrop" role="presentation" onMouseDown={() => setCommandOpen(false)}><section className="command-palette" role="dialog" aria-modal="true" aria-label="命令面板" onMouseDown={(event) => event.stopPropagation()}>
+        <div className="command-search"><span>⌘</span><input ref={commandInputRef} value={commandQuery} onChange={(event) => setCommandQuery(event.target.value)} placeholder="搜尋命令…" aria-label="搜尋命令" /></div>
+        <div className="command-list">{filteredCommands.length ? filteredCommands.map((command) => <button key={command.label} type="button" data-action={command.action} disabled={command.disabled} onClick={handleCommandClick}><span>{command.label}</span><kbd>{command.hint}</kbd></button>) : <p>找不到符合的命令</p>}</div>
+        <div className="command-footer"><span>Enter 執行</span><span>Esc 關閉</span></div>
+      </section></div>}
+      {shortcutsOpen && <div className="modal-backdrop" role="presentation" onMouseDown={() => setShortcutsOpen(false)}><section className="shortcut-dialog" role="dialog" aria-modal="true" aria-labelledby="shortcut-title" onMouseDown={(event) => event.stopPropagation()}><div className="dialog-heading"><div><span>REFERENCE</span><h2 id="shortcut-title">鍵盤快捷鍵</h2></div><button type="button" onClick={() => setShortcutsOpen(false)} aria-label="關閉">×</button></div><dl><div><dt>命令面板</dt><dd>⌘ K</dd></div><div><dt>格式化 JSON</dt><dd>⌘ Enter</dd></div><div><dt>搜尋／取代</dt><dd>⌘ F</dd></div><div><dt>復原</dt><dd>⌘ Z</dd></div><div><dt>重做</dt><dd>⌘ ⇧ Z</dd></div><div><dt>縮排</dt><dd>Tab</dd></div></dl><p>Windows / Linux 請使用 Ctrl 取代 ⌘。</p></section></div>}
+      {contextMenu && <div className="tree-menu" style={{ left: Math.min(contextMenu.x, window.innerWidth - 190), top: Math.min(contextMenu.y, window.innerHeight - 150) }} role="menu" onClick={(event) => event.stopPropagation()}><strong title={contextMenu.path}>{contextMenu.path}</strong><button type="button" role="menuitem" onClick={() => { copyText(contextMenu.path, "已複製 JSONPath"); setContextMenu(null); }}>複製 JSONPath</button><button type="button" role="menuitem" onClick={() => { copyText(typeof contextMenu.value === "string" ? contextMenu.value : JSON.stringify(contextMenu.value), "已複製節點值"); setContextMenu(null); }}>複製值</button><button type="button" role="menuitem" onClick={() => { copyText(JSON.stringify(contextMenu.value, null, 2), "已複製節點 JSON"); setContextMenu(null); }}>複製節點 JSON</button></div>}
       {toast && <div className="toast" role="status">{toast}</div>}
     </main>
   );
