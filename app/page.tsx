@@ -18,6 +18,8 @@ const SAMPLE = `{
 
 const STORAGE_KEY = "json-tool-workspace-v3";
 const AUTOSAVE_KEY = "json-tool-autosave";
+const LARGE_FILE_BYTES = 1_000_000;
+const HUGE_FILE_BYTES = 10_000_000;
 
 type Validation = {
   valid: boolean;
@@ -25,6 +27,24 @@ type Validation = {
   position?: number;
   line?: number;
   column?: number;
+  context?: string;
+  hint?: string;
+};
+
+type JsonStats = { lines: number; chars: number; keys: number };
+type JsonPathMatch = { path: string; value: unknown };
+type WorkerMode = "analyze" | "format" | "minify" | "query";
+type WorkerResponse = {
+  id: number;
+  mode: WorkerMode;
+  ok: boolean;
+  output?: string;
+  stats?: JsonStats;
+  validation?: Validation;
+  matches?: JsonPathMatch[];
+  limited?: boolean;
+  applyOutput?: boolean;
+  duration: number;
 };
 
 type ViewMode = "code" | "tree";
@@ -217,38 +237,115 @@ export default function Home() {
   const [commandQuery, setCommandQuery] = useState("");
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
+  const [result, setResult] = useState<Validation>({ valid: true, message: "語法正確" });
+  const [stats, setStats] = useState<JsonStats>({ lines: 10, chars: new Blob([SAMPLE]).size, keys: 7 });
+  const [processing, setProcessing] = useState(false);
+  const [processingLabel, setProcessingLabel] = useState("");
+  const [lastDuration, setLastDuration] = useState(0);
+  const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
+  const [jsonPath, setJsonPath] = useState("$");
+  const [jsonPathMatches, setJsonPathMatches] = useState<JsonPathMatch[]>([]);
+  const [jsonPathError, setJsonPathError] = useState("");
+  const [jsonPathLimited, setJsonPathLimited] = useState(false);
+  const [queryRunning, setQueryRunning] = useState(false);
 
   const editorRef = useRef<JsonCodeEditorHandle>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const editorsRef = useRef<HTMLDivElement>(null);
   const commandInputRef = useRef<HTMLInputElement>(null);
-  const result = useMemo(() => validate(source), [source]);
-
-  const parsed = useMemo(() => {
-    try { return JSON.parse(source); } catch { return null; }
-  }, [source]);
+  const jsonPathInputRef = useRef<HTMLInputElement>(null);
+  const workerRef = useRef<Worker | null>(null);
+  const requestIdRef = useRef(0);
+  const activeAnalysisRef = useRef(0);
+  const largeModeNotifiedRef = useRef(false);
+  const sourceBytes = useMemo(() => new Blob([source]).size, [source]);
+  const largeMode = sourceBytes >= LARGE_FILE_BYTES;
+  const hugeMode = sourceBytes >= HUGE_FILE_BYTES;
 
   const outputParsed = useMemo(() => {
+    if (largeMode) return null;
     try { return JSON.parse(output); } catch { return null; }
-  }, [output]);
-
-  const stats = useMemo(() => ({
-    lines: source ? source.split("\n").length : 0,
-    chars: new Blob([source]).size,
-    keys: parsed === null ? 0 : countKeys(parsed),
-  }), [parsed, source]);
+  }, [largeMode, output]);
 
   const showToast = useCallback((message: string) => {
     setToast(message);
     window.setTimeout(() => setToast(""), 1700);
   }, []);
 
+  const handleWorkerMessage = useCallback((event: MessageEvent<WorkerResponse>) => {
+    const response = event.data;
+    setLastDuration(response.duration);
+    if (response.mode === "query") {
+      setQueryRunning(false);
+      if (response.ok) {
+        setJsonPathMatches(response.matches ?? []);
+        setJsonPathLimited(Boolean(response.limited));
+        setJsonPathError("");
+      } else {
+        setJsonPathMatches([]);
+        setJsonPathLimited(false);
+        setJsonPathError(response.validation?.message ?? "JSONPath 查詢失敗");
+      }
+      return;
+    }
+    if (response.mode === "analyze" && response.id !== activeAnalysisRef.current) return;
+    setProcessing(false);
+    setProcessingLabel("");
+    if (response.validation) {
+      setResult(response.validation);
+      setDiagnosticsOpen(!response.validation.valid);
+    }
+    if (response.stats) setStats(response.stats);
+    if (response.ok && response.output && (response.mode !== "analyze" || response.applyOutput)) {
+      setOutput(response.output);
+    }
+    if (response.ok && response.mode === "format") {
+      setMobilePanel("output");
+      showToast("JSON 已格式化");
+    }
+    if (response.ok && response.mode === "minify") {
+      setViewMode("code");
+      setMobilePanel("output");
+      showToast("JSON 已壓縮");
+    }
+  }, [showToast]);
+
+  const handleWorkerError = useCallback(() => {
+    setProcessing(false);
+    setQueryRunning(false);
+    setResult({ valid: false, message: "背景處理程序發生錯誤，請重新整理後再試。" });
+    setDiagnosticsOpen(true);
+  }, []);
+
+  useEffect(() => {
+    const worker = new Worker("/json-worker.js");
+    workerRef.current = worker;
+    worker.onmessage = handleWorkerMessage;
+    worker.onerror = handleWorkerError;
+    return () => {
+      worker.terminate();
+      workerRef.current = null;
+    };
+  }, [handleWorkerError, handleWorkerMessage]);
+
+  const postWorker = useCallback((mode: WorkerMode, options: { query?: string; applyOutput?: boolean } = {}) => {
+    const worker = workerRef.current;
+    if (!worker) return 0;
+    const id = ++requestIdRef.current;
+    worker.postMessage({ id, mode, source, indent, sortKeys, ...options });
+    return id;
+  }, [indent, sortKeys, source]);
+
   const format = useCallback(() => {
-    if (!result.valid) return;
-    setOutput(formatJson(source, indent, sortKeys));
-    setMobilePanel("output");
-    showToast("JSON 已格式化");
-  }, [indent, result.valid, showToast, sortKeys, source]);
+    if (!result.valid || processing) return;
+    setProcessing(true);
+    setProcessingLabel("正在格式化");
+    if (!postWorker("format")) {
+      setOutput(formatJson(source, indent, sortKeys));
+      setProcessing(false);
+      setMobilePanel("output");
+    }
+  }, [indent, postWorker, processing, result.valid, sortKeys, source]);
 
   const newDocument = useCallback(() => {
     setSource("");
@@ -288,10 +385,40 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    if (!autoSync || !result.valid) return;
-    const timer = window.setTimeout(() => setOutput(formatJson(source, indent, sortKeys)), 0);
+    if (!largeMode) {
+      largeModeNotifiedRef.current = false;
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      if (!largeModeNotifiedRef.current) {
+        largeModeNotifiedRef.current = true;
+        showToast("大型檔案模式已暫停即時同步");
+      }
+      if (viewMode === "tree") setViewMode("code");
+    }, 0);
     return () => window.clearTimeout(timer);
-  }, [autoSync, indent, result.valid, sortKeys, source]);
+  }, [largeMode, showToast, viewMode]);
+
+  useEffect(() => {
+    const delay = largeMode ? 450 : 120;
+    const timer = window.setTimeout(() => {
+      if (largeMode) {
+        setProcessing(true);
+        setProcessingLabel("背景驗證中");
+      }
+      const id = postWorker("analyze", { applyOutput: autoSync && !largeMode });
+      if (id) {
+        activeAnalysisRef.current = id;
+        return;
+      }
+      const fallbackResult = validate(source);
+      setResult(fallbackResult);
+      setDiagnosticsOpen(!fallbackResult.valid);
+      if (fallbackResult.valid && autoSync && !largeMode) setOutput(formatJson(source, indent, sortKeys));
+      setStats({ lines: source ? source.split("\n").length : 0, chars: sourceBytes, keys: fallbackResult.valid ? countKeys(JSON.parse(source)) : 0 });
+    }, delay);
+    return () => window.clearTimeout(timer);
+  }, [autoSync, indent, largeMode, postWorker, sortKeys, source, sourceBytes]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => setTreeSelection(null), 0);
@@ -358,12 +485,29 @@ export default function Home() {
   }, []);
 
   const minify = () => {
-    if (!result.valid) return;
-    const value = sortKeys ? sortObject(JSON.parse(source)) : JSON.parse(source);
-    setOutput(JSON.stringify(value));
-    setViewMode("code");
-    setMobilePanel("output");
-    showToast("JSON 已壓縮");
+    if (!result.valid || processing) return;
+    setProcessing(true);
+    setProcessingLabel("正在壓縮");
+    postWorker("minify");
+  };
+
+  const cancelProcessing = () => {
+    workerRef.current?.terminate();
+    const worker = new Worker("/json-worker.js");
+    worker.onmessage = handleWorkerMessage;
+    worker.onerror = handleWorkerError;
+    workerRef.current = worker;
+    setProcessing(false);
+    setQueryRunning(false);
+    setProcessingLabel("");
+    showToast("已取消背景處理");
+  };
+
+  const runJsonPath = () => {
+    if (!result.valid || !jsonPath.trim()) return;
+    setQueryRunning(true);
+    setJsonPathError("");
+    postWorker("query", { query: jsonPath.trim() });
   };
 
   const copyText = async (text: string, message: string) => {
@@ -409,7 +553,7 @@ export default function Home() {
   };
 
   const beginResize = (event: ReactPointerEvent<HTMLDivElement>) => {
-    if (!editorsRef.current || window.matchMedia("(max-width: 760px)").matches) return;
+    if (!editorsRef.current || window.matchMedia("(max-width: 960px)").matches) return;
     event.preventDefault();
     const bounds = editorsRef.current.getBoundingClientRect();
     const move = (pointerEvent: PointerEvent) => {
@@ -447,6 +591,7 @@ export default function Home() {
     if (action === "new") newDocument();
     if (action === "copy") copyOutput();
     if (action === "download") download();
+    if (action === "jsonpath") window.setTimeout(() => jsonPathInputRef.current?.focus(), 0);
     if (action === "theme") setTheme((current) => current === "light" ? "dark" : "light");
   };
 
@@ -458,6 +603,7 @@ export default function Home() {
     { label: "建立新文件", hint: "", action: "new" },
     { label: "複製結果", hint: "", action: "copy", disabled: !output },
     { label: "下載結果", hint: "", action: "download", disabled: !output },
+    { label: "JSONPath 查詢", hint: "", action: "jsonpath", disabled: !result.valid },
     { label: theme === "light" ? "切換深色模式" : "切換淺色模式", hint: "", action: "theme" },
   ];
   const filteredCommands = commands.filter((command) => command.label.toLowerCase().includes(commandQuery.trim().toLowerCase()));
@@ -518,16 +664,17 @@ export default function Home() {
             <button className="ghost-button" type="button" onClick={() => fileInputRef.current?.click()}>開啟檔案</button>
             <input ref={fileInputRef} className="visually-hidden" type="file" accept=".json,application/json,text/plain" onChange={(event) => openFile(event.target.files?.[0])} />
             <span className="file-name" title={fileName}>{fileName}</span>
+            {largeMode && <span className={`large-mode-badge ${hugeMode ? "is-huge" : ""}`}>{hugeMode ? "超大型檔案" : "大型檔案"}</span>}
           </div>
           <div className="toolbar-group format-tools">
             <label className="compact-field"><span>縮排</span>
               <select value={indent} onChange={(event) => setIndent(event.target.value)} aria-label="縮排方式"><option value="2">2 spaces</option><option value="4">4 spaces</option><option value="tab">Tab</option></select>
             </label>
             <label className="check-label"><input type="checkbox" checked={sortKeys} onChange={(event) => setSortKeys(event.target.checked)} />排序鍵值</label>
-            <label className="check-label"><input type="checkbox" checked={autoSync} onChange={(event) => setAutoSync(event.target.checked)} />即時同步</label>
+            <label className="check-label" title={largeMode ? "大型檔案模式會暫停即時同步，檔案縮小後自動恢復" : undefined}><input type="checkbox" checked={autoSync && !largeMode} disabled={largeMode} onChange={(event) => setAutoSync(event.target.checked)} />即時同步</label>
           </div>
           <div className="toolbar-actions">
-            <button className="ghost-button" type="button" onClick={minify} disabled={!result.valid}>壓縮</button>
+            <button className="ghost-button" type="button" onClick={minify} disabled={!result.valid || processing}>壓縮</button>
             <details className="more-menu">
               <summary>更多</summary>
               <div className="more-menu-popover">
@@ -538,9 +685,10 @@ export default function Home() {
                 <button type="button" onClick={() => setShortcutsOpen(true)}>鍵盤快捷鍵 <span>⌘/</span></button>
               </div>
             </details>
-            <button className="primary-button" type="button" onClick={format} disabled={!result.valid}>格式化 <kbd>⌘↵</kbd></button>
+            <button className="primary-button" type="button" onClick={format} disabled={!result.valid || processing}>格式化 <kbd>⌘↵</kbd></button>
           </div>
         </nav>
+        {processing && <div className="worker-progress" role="status"><span className="worker-progress-track"><span /></span><strong>{processingLabel || "背景處理中"}</strong><span>{(sourceBytes / 1_000_000).toFixed(2)} MB</span><button type="button" onClick={cancelProcessing}>取消</button></div>}
 
         <div className="mobile-tabs" role="tablist" aria-label="編輯器面板">
           <button role="tab" aria-selected={mobilePanel === "input"} className={mobilePanel === "input" ? "active" : ""} type="button" onClick={() => setMobilePanel("input")}>輸入</button>
@@ -562,11 +710,20 @@ export default function Home() {
               <JsonCodeEditor ref={editorRef} value={source} onChange={setSource} validation={result} theme={theme} />
               {!source && <button className="empty-editor" type="button" onClick={() => fileInputRef.current?.click()}><strong>貼上或開啟 JSON</strong><span>也可以將 .json 檔案拖放到工作區</span></button>}
             </div>
-            <button className={`validation ${result.valid ? "is-valid" : "is-error"}`} type="button" onClick={focusError} disabled={result.position === undefined}>
-              <span className="status-icon">{result.valid ? "✓" : "!"}</span>
-              <span><strong>{result.valid ? "JSON 語法正確" : result.message}</strong>{result.line && ` · 第 ${result.line} 行，第 ${result.column} 欄`}</span>
-              {!result.valid && result.position !== undefined && <em>跳到錯誤</em>}
-            </button>
+            <div className="diagnostics-shell">
+              <button className={`validation ${result.valid ? "is-valid" : "is-error"}`} type="button" aria-expanded={diagnosticsOpen} onClick={() => !result.valid && setDiagnosticsOpen((open) => !open)} disabled={result.valid}>
+                <span className="status-icon">{result.valid ? "✓" : "!"}</span>
+                <span><strong>{result.valid ? "JSON 語法正確" : result.message}</strong>{result.line && ` · 第 ${result.line} 行，第 ${result.column} 欄`}</span>
+                <em>{result.valid ? "0 個問題" : diagnosticsOpen ? "收合診斷" : "1 個問題"}</em>
+              </button>
+              {diagnosticsOpen && !result.valid && <div className="diagnostics-panel" role="region" aria-label="JSON 錯誤診斷">
+                <div className="diagnostic-heading"><span>ERROR</span><strong>JSON 語法錯誤</strong>{result.position !== undefined && <button type="button" onClick={focusError}>跳到錯誤</button>}</div>
+                <p>{result.message}</p>
+                <dl><div><dt>位置</dt><dd>{result.line ? `第 ${result.line} 行，第 ${result.column} 欄` : "無法判定"}</dd></div><div><dt>字元偏移</dt><dd>{result.position ?? "—"}</dd></div></dl>
+                {result.context && <pre><code>{result.context}</code></pre>}
+                {result.hint && <p className="diagnostic-hint">建議：{result.hint}</p>}
+              </div>}
+            </div>
           </article>
 
           <div className="pane-divider" role="separator" aria-label="調整編輯器面板寬度" aria-orientation="vertical" aria-valuemin={28} aria-valuemax={72} aria-valuenow={Math.round(paneWidth)} tabIndex={0} onPointerDown={beginResize}
@@ -581,7 +738,7 @@ export default function Home() {
             <div className="panel-header">
               <div className="panel-title"><span className="panel-index">02</span><h2>格式化結果</h2></div>
               <div className="panel-actions">
-                <div className="view-switch" aria-label="結果檢視模式"><button className={viewMode === "code" ? "active" : ""} type="button" onClick={() => setViewMode("code")}>程式碼</button><button className={viewMode === "tree" ? "active" : ""} type="button" onClick={() => setViewMode("tree")} disabled={outputParsed === null}>樹狀</button></div>
+                <div className="view-switch" aria-label="結果檢視模式"><button className={viewMode === "code" ? "active" : ""} type="button" onClick={() => setViewMode("code")}>程式碼</button><button className={viewMode === "tree" ? "active" : ""} type="button" onClick={() => setViewMode("tree")} disabled={outputParsed === null || largeMode} title={largeMode ? "大型檔案模式暫停樹狀檢視" : undefined}>樹狀</button></div>
                 <button className="text-button" type="button" onClick={copyOutput} disabled={!output}>{copied ? "已複製" : "複製"}</button>
                 <details className="panel-menu">
                   <summary aria-label="更多結果操作">操作</summary>
@@ -592,6 +749,18 @@ export default function Home() {
                 </details>
               </div>
             </div>
+            <section className="jsonpath-explorer" aria-label="JSONPath Explorer">
+              <form onSubmit={(event) => { event.preventDefault(); runJsonPath(); }}>
+                <label htmlFor="jsonpath-query">JSONPath</label>
+                <input ref={jsonPathInputRef} id="jsonpath-query" value={jsonPath} onChange={(event) => setJsonPath(event.target.value)} placeholder="$.items[*].name" spellCheck={false} />
+                <button type="submit" disabled={!result.valid || queryRunning}>{queryRunning ? "查詢中" : "查詢"}</button>
+              </form>
+              <div className="jsonpath-help"><span>支援屬性、索引、萬用字元與遞迴鍵名</span>{jsonPathMatches.length > 0 && <strong>{jsonPathMatches.length}{jsonPathLimited ? "+" : ""} 筆結果</strong>}</div>
+              {jsonPathError && <div className="jsonpath-error" role="alert">{jsonPathError}</div>}
+              {jsonPathMatches.length > 0 && <div className="jsonpath-results">
+                {jsonPathMatches.map((match, index) => <div className="jsonpath-result-row" key={`${match.path}-${index}`}><button type="button" onClick={() => { setTreeSelection(match); if (!largeMode) setViewMode("tree"); }} title={match.path}><code>{match.path}</code><span>{typeof match.value === "string" ? match.value : JSON.stringify(match.value)}</span></button><button className="jsonpath-copy" type="button" onClick={() => copyText(JSON.stringify(match.value, null, 2), "已複製查詢結果")}>複製</button></div>)}
+              </div>}
+            </section>
             {viewMode === "tree" && outputParsed !== null ? (
               <>
                 <div className="tree-contextbar">
@@ -615,7 +784,7 @@ export default function Home() {
                 {output ? <JsonCodeEditor value={output} onChange={() => undefined} validation={outputValidation} theme={theme} readOnly /> : <div className="output-empty"><strong>尚無結果</strong><span>輸入有效 JSON 後，結果會自動顯示。</span></div>}
               </div>
             )}
-            <div className="stats" aria-label="JSON 統計資訊"><span><strong>{stats.keys}</strong> keys</span><span><strong>{stats.chars.toLocaleString()}</strong> bytes</span><span>UTF-8</span><span className="stats-spacer" /><span>{autoSync ? "AUTO SYNC ON" : "MANUAL"}</span></div>
+            <div className="stats" aria-label="JSON 統計資訊"><span><strong>{stats.keys}</strong> keys</span><span><strong>{stats.chars.toLocaleString()}</strong> bytes</span><span>UTF-8</span><span>{lastDuration > 0 ? `${lastDuration.toFixed(1)} ms` : ""}</span><span className="stats-spacer" /><span>{largeMode ? "WORKER MODE" : autoSync ? "AUTO SYNC ON" : "MANUAL"}</span></div>
           </article>
         </div>
       </section>
