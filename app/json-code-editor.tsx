@@ -33,6 +33,8 @@ import {
   setDiagnostics,
 } from "@codemirror/lint";
 import {
+  Decoration,
+  type DecorationSet,
   drawSelection,
   dropCursor,
   EditorView,
@@ -64,11 +66,16 @@ export type JsonCodeEditorHandle = {
   jumpTo: (position: number) => void;
   openSearch: () => void;
   redo: () => void;
+  scrollToRatio: (ratio: number) => void;
   undo: () => void;
 };
 
+export type EditorHighlight = { from: number; to: number; kind: string };
+
 type JsonCodeEditorProps = {
+  highlights?: EditorHighlight[];
   onChange: (value: string) => void;
+  onScrollRatio?: (ratio: number) => void;
   readOnly?: boolean;
   theme: "light" | "dark";
   validation: EditorValidation;
@@ -89,18 +96,24 @@ const lightTheme = EditorView.theme({
 });
 
 const JsonCodeEditor = forwardRef<JsonCodeEditorHandle, JsonCodeEditorProps>(
-  function JsonCodeEditor({ onChange, readOnly = false, theme, validation, value }, ref) {
+  function JsonCodeEditor({ highlights = [], onChange, onScrollRatio, readOnly = false, theme, validation, value }, ref) {
     const hostRef = useRef<HTMLDivElement>(null);
     const viewRef = useRef<EditorView | null>(null);
     const onChangeRef = useRef(onChange);
+    const onScrollRatioRef = useRef(onScrollRatio);
     const initialValueRef = useRef(value);
     const initialThemeRef = useRef(theme);
     const initialReadOnlyRef = useRef(readOnly);
     const themeCompartmentRef = useRef(new Compartment());
+    const highlightCompartmentRef = useRef(new Compartment());
 
     useEffect(() => {
       onChangeRef.current = onChange;
     }, [onChange]);
+
+    useEffect(() => {
+      onScrollRatioRef.current = onScrollRatio;
+    }, [onScrollRatio]);
 
     useEffect(() => {
       if (!hostRef.current) return;
@@ -137,7 +150,15 @@ const JsonCodeEditor = forwardRef<JsonCodeEditorHandle, JsonCodeEditorProps>(
           EditorView.updateListener.of((update) => {
             if (update.docChanged) onChangeRef.current(update.state.doc.toString());
           }),
+          EditorView.domEventHandlers({
+            scroll: (_event, view) => {
+              const scroller = view.scrollDOM;
+              const maximum = scroller.scrollHeight - scroller.clientHeight;
+              onScrollRatioRef.current?.(maximum > 0 ? scroller.scrollTop / maximum : 0);
+            },
+          }),
           themeCompartment.of(initialThemeRef.current === "dark" ? oneDark : lightTheme),
+          highlightCompartmentRef.current.of(EditorView.decorations.of(Decoration.none)),
         ],
       });
       const view = new EditorView({ state, parent: hostRef.current });
@@ -163,6 +184,19 @@ const JsonCodeEditor = forwardRef<JsonCodeEditorHandle, JsonCodeEditorProps>(
         effects: themeCompartmentRef.current.reconfigure(theme === "dark" ? oneDark : lightTheme),
       });
     }, [theme]);
+
+    useEffect(() => {
+      const view = viewRef.current;
+      if (!view) return;
+      const length = view.state.doc.length;
+      const ranges = highlights
+        .map((highlight) => ({ ...highlight, from: Math.min(Math.max(0, highlight.from), length), to: Math.min(Math.max(highlight.from + 1, highlight.to), length) }))
+        .filter((highlight) => highlight.from < highlight.to)
+        .sort((a, b) => a.from - b.from)
+        .map((highlight) => Decoration.mark({ class: `cm-diff-${highlight.kind}` }).range(highlight.from, highlight.to));
+      const decorations: DecorationSet = Decoration.set(ranges, true);
+      view.dispatch({ effects: highlightCompartmentRef.current.reconfigure(EditorView.decorations.of(decorations)) });
+    }, [highlights]);
 
     useEffect(() => {
       const view = viewRef.current;
@@ -205,6 +239,11 @@ const JsonCodeEditor = forwardRef<JsonCodeEditorHandle, JsonCodeEditorProps>(
       redo: () => {
         const view = viewRef.current;
         if (view) redo(view);
+      },
+      scrollToRatio: (ratio: number) => {
+        const scroller = viewRef.current?.scrollDOM;
+        if (!scroller) return;
+        scroller.scrollTop = Math.max(0, Math.min(1, ratio)) * Math.max(0, scroller.scrollHeight - scroller.clientHeight);
       },
       undo: () => {
         const view = viewRef.current;

@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent } from "react";
 import JsonCodeEditor from "./json-code-editor";
 import type { JsonCodeEditorHandle } from "./json-code-editor";
+import CompareWorkspace from "./compare-workspace";
 
 const SAMPLE = `{
   "project": "Aurora",
@@ -224,6 +225,7 @@ export default function Home() {
   const [saveState, setSaveState] = useState("本機自動儲存");
   const [viewMode, setViewMode] = useState<ViewMode>("code");
   const [theme, setTheme] = useState<Theme>("light");
+  const [compareMode, setCompareMode] = useState(false);
   const [mobilePanel, setMobilePanel] = useState<MobilePanel>("input");
   const [paneWidth, setPaneWidth] = useState(50);
   const [treeExpansion, setTreeExpansion] = useState<TreeExpansion>("default");
@@ -608,6 +610,8 @@ export default function Home() {
   ];
   const filteredCommands = commands.filter((command) => command.label.toLowerCase().includes(commandQuery.trim().toLowerCase()));
 
+  if (compareMode) return <CompareWorkspace theme={theme} initialLeft={source} onTheme={() => setTheme((current) => current === "light" ? "dark" : "light")} onBack={() => setCompareMode(false)} />;
+
   return (
     <main
       className="app-shell"
@@ -632,6 +636,7 @@ export default function Home() {
         <div className="topbar-meta">
           <span className="save-indicator" title={saveState}><span />{saveState}</span>
           <span className="local-badge"><span />Local only</span>
+          <button className="command-trigger" type="button" onClick={() => setCompareMode(true)}>差異比較</button>
           <button className="command-trigger" type="button" onClick={() => setCommandOpen(true)} aria-label="開啟命令面板">命令 <kbd>⌘K</kbd></button>
           <button className="theme-button" type="button" onClick={() => setTheme((current) => current === "light" ? "dark" : "light")} aria-label={theme === "light" ? "切換深色模式" : "切換淺色模式"}>
             {theme === "light" ? "深色" : "淺色"}

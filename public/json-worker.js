@@ -1,4 +1,5 @@
 const MAX_QUERY_RESULTS = 100;
+const MAX_DIFF_RESULTS = 500;
 
 function locateError(source, error) {
   const message = error instanceof Error ? error.message : "無法解析 JSON";
@@ -125,8 +126,98 @@ function queryJsonPath(root, query) {
   return nodes;
 }
 
+function valueType(value) {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "array";
+  return typeof value;
+}
+
+function stableStringify(value) {
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function pathIgnored(path, patterns) {
+  return patterns.some((pattern) => {
+    const clean = pattern.trim();
+    if (!clean) return false;
+    if (clean.endsWith(".*")) return path === clean.slice(0, -2) || path.startsWith(`${clean.slice(0, -2)}.`) || path.startsWith(`${clean.slice(0, -2)}[`);
+    return path === clean || path.startsWith(`${clean}.`) || path.startsWith(`${clean}[`);
+  });
+}
+
+function toPointer(path) {
+  if (path === "$") return "";
+  const parts = [];
+  const matcher = /\.([A-Za-z_$][\w$]*)|\[(\d+)\]|\["((?:\\.|[^"\\])*)"\]/g;
+  let match;
+  while ((match = matcher.exec(path))) parts.push(match[1] ?? match[2] ?? JSON.parse(`"${match[3]}"`));
+  return `/${parts.map((part) => String(part).replace(/~/g, "~0").replace(/\//g, "~1")).join("/")}`;
+}
+
+function diffJson(left, right, options) {
+  const results = [];
+  const ignored = options.ignorePaths ?? [];
+  const add = (entry) => {
+    if (results.length < MAX_DIFF_RESULTS) results.push({ ...entry, pointer: toPointer(entry.path) });
+  };
+  const walk = (before, after, path) => {
+    if (results.length >= MAX_DIFF_RESULTS || pathIgnored(path, ignored)) return;
+    const beforeType = valueType(before);
+    const afterType = valueType(after);
+    if (beforeType !== afterType) {
+      add({ path, operation: "type-change", oldValue: before, newValue: after, oldType: beforeType, newType: afterType });
+      return;
+    }
+    if (Array.isArray(before)) {
+      if (options.arrayMode === "set" || options.ignoreArrayOrder) {
+        const leftMap = new Map(before.map((item, index) => [stableStringify(item), { item, index }]));
+        const rightMap = new Map(after.map((item, index) => [stableStringify(item), { item, index }]));
+        for (const [key, value] of leftMap) if (!rightMap.has(key)) add({ path: childPath(path, String(value.index), true), operation: "remove", oldValue: value.item, oldType: valueType(value.item) });
+        for (const [key, value] of rightMap) if (!leftMap.has(key)) add({ path: childPath(path, String(value.index), true), operation: "add", newValue: value.item, newType: valueType(value.item) });
+        return;
+      }
+      if (options.arrayMode === "key" && options.arrayKey && before.every((item) => item && typeof item === "object") && after.every((item) => item && typeof item === "object")) {
+        const leftMap = new Map(before.map((item, index) => [String(item[options.arrayKey]), { item, index }]));
+        const rightMap = new Map(after.map((item, index) => [String(item[options.arrayKey]), { item, index }]));
+        for (const [key, value] of leftMap) {
+          const target = rightMap.get(key);
+          if (!target) add({ path: childPath(path, String(value.index), true), operation: "remove", oldValue: value.item, oldType: "object", matchKey: key });
+          else walk(value.item, target.item, childPath(path, String(target.index), true));
+        }
+        for (const [key, value] of rightMap) if (!leftMap.has(key)) add({ path: childPath(path, String(value.index), true), operation: "add", newValue: value.item, newType: "object", matchKey: key });
+        return;
+      }
+      const length = Math.max(before.length, after.length);
+      for (let index = 0; index < length; index += 1) {
+        const itemPath = childPath(path, String(index), true);
+        if (index >= before.length) add({ path: itemPath, operation: "add", newValue: after[index], newType: valueType(after[index]) });
+        else if (index >= after.length) add({ path: itemPath, operation: "remove", oldValue: before[index], oldType: valueType(before[index]) });
+        else walk(before[index], after[index], itemPath);
+      }
+      return;
+    }
+    if (before && typeof before === "object") {
+      const keys = new Set([...Object.keys(before), ...Object.keys(after)]);
+      for (const key of keys) {
+        const itemPath = childPath(path, key, false);
+        if (!Object.prototype.hasOwnProperty.call(after, key)) add({ path: itemPath, operation: "remove", oldValue: before[key], oldType: valueType(before[key]) });
+        else if (!Object.prototype.hasOwnProperty.call(before, key)) add({ path: itemPath, operation: "add", newValue: after[key], newType: valueType(after[key]) });
+        else walk(before[key], after[key], itemPath);
+      }
+      return;
+    }
+    if (!Object.is(before, after)) add({ path, operation: "replace", oldValue: before, newValue: after, oldType: beforeType, newType: afterType });
+  };
+  walk(left, right, "$");
+  return { results, limited: results.length >= MAX_DIFF_RESULTS };
+}
+
 self.onmessage = (event) => {
-  const { id, mode, source, indent = "2", sortKeys = false, query = "$", applyOutput = false } = event.data;
+  const { id, mode, source, rightSource, indent = "2", sortKeys = false, query = "$", applyOutput = false, diffOptions = {} } = event.data;
   const startedAt = performance.now();
   try {
     if (!source.trim()) {
@@ -134,6 +225,17 @@ self.onmessage = (event) => {
       return;
     }
     const parsed = JSON.parse(source);
+    if (mode === "compare") {
+      let right;
+      try { right = JSON.parse(rightSource); }
+      catch (error) {
+        self.postMessage({ id, mode, ok: false, side: "right", validation: locateError(rightSource, error), duration: performance.now() - startedAt });
+        return;
+      }
+      const comparison = diffJson(parsed, right, diffOptions);
+      self.postMessage({ id, mode, ok: true, diffs: comparison.results, limited: comparison.limited, duration: performance.now() - startedAt });
+      return;
+    }
     const value = sortKeys ? sortObject(parsed) : parsed;
     const stats = {
       lines: source.split("\n").length,
@@ -166,6 +268,7 @@ self.onmessage = (event) => {
       id,
       mode,
       ok: false,
+      ...(mode === "compare" ? { side: "left" } : {}),
       validation,
       stats: { lines: source ? source.split("\n").length : 0, chars: new TextEncoder().encode(source).length, keys: 0 },
       duration: performance.now() - startedAt,
