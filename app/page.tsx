@@ -494,8 +494,8 @@ export default function Home() {
       </header>
 
       <section className="tool-heading" aria-labelledby="page-title">
-        <div><h1 id="page-title">JSON Formatter &amp; Validator</h1><p>格式化、驗證與檢視 JSON，資料不離開瀏覽器。</p></div>
-        <div className={`document-status ${result.valid ? "is-valid" : "is-error"}`}><span>{result.valid ? "✓" : "!"}</span><strong>{result.valid ? "VALID JSON" : "INVALID JSON"}</strong></div>
+        <div><h1 id="page-title">JSON 工作區</h1><p>即時驗證、格式化與檢視 · 僅在本機處理</p></div>
+        <div className={`document-status ${result.valid ? "is-valid" : "is-error"}`}><span>{result.valid ? "✓" : "!"}</span><strong>{result.valid ? "語法正確" : "語法錯誤"}</strong></div>
       </section>
 
       <section
@@ -550,7 +550,7 @@ export default function Home() {
         <div ref={editorsRef} className="editors" style={{ "--left-pane": `${paneWidth}fr`, "--right-pane": `${100 - paneWidth}fr` } as CSSProperties}>
           <article className={`editor-panel input-panel ${mobilePanel !== "input" ? "mobile-inactive" : ""}`}>
             <div className="panel-header">
-              <div className="panel-title"><span className="panel-index">01</span><h2>CodeMirror 編輯器</h2></div>
+              <div className="panel-title"><span className="panel-index">01</span><h2>輸入 JSON</h2></div>
               <div className="panel-actions">
                 <span className="mini-stat">{stats.lines} lines</span>
                 <button className="text-button" type="button" onClick={() => editorRef.current?.undo()} title="復原（⌘Z）">Undo</button>
@@ -579,21 +579,32 @@ export default function Home() {
 
           <article className={`editor-panel output-panel ${mobilePanel !== "output" ? "mobile-inactive" : ""}`}>
             <div className="panel-header">
-              <div className="panel-title"><span className="panel-index">02</span><h2>結果</h2></div>
+              <div className="panel-title"><span className="panel-index">02</span><h2>格式化結果</h2></div>
               <div className="panel-actions">
-                {viewMode === "tree" && <div className="tree-actions"><button type="button" onClick={() => changeTreeExpansion("all")}>全部展開</button><button type="button" onClick={() => changeTreeExpansion("none")}>全部收合</button></div>}
                 <div className="view-switch" aria-label="結果檢視模式"><button className={viewMode === "code" ? "active" : ""} type="button" onClick={() => setViewMode("code")}>程式碼</button><button className={viewMode === "tree" ? "active" : ""} type="button" onClick={() => setViewMode("tree")} disabled={outputParsed === null}>樹狀</button></div>
                 <button className="text-button" type="button" onClick={copyOutput} disabled={!output}>{copied ? "已複製" : "複製"}</button>
-                <button className="text-button" type="button" onClick={download} disabled={!output}>下載</button>
+                <details className="panel-menu">
+                  <summary aria-label="更多結果操作">操作</summary>
+                  <div className="panel-menu-popover">
+                    {viewMode === "tree" && <><button type="button" onClick={() => changeTreeExpansion("all")}>全部展開</button><button type="button" onClick={() => changeTreeExpansion("none")}>全部收合</button></>}
+                    <button type="button" onClick={download} disabled={!output}>下載 JSON</button>
+                  </div>
+                </details>
               </div>
             </div>
             {viewMode === "tree" && outputParsed !== null ? (
               <>
                 <div className="tree-contextbar">
                   <code title={selectedPath}>{selectedPath}</code>
-                  <button type="button" onClick={() => copyText(selectedPath, "已複製 JSONPath")}>複製路徑</button>
-                  <button type="button" onClick={() => copyText(selectedDisplayValue, "已複製節點值")}>複製值</button>
-                  <button type="button" onClick={() => copyText(selectedJson, "已複製節點 JSON")}>複製 JSON</button>
+                  <button className="tree-copy-primary" type="button" onClick={() => copyText(selectedJson, "已複製節點 JSON")}>複製節點</button>
+                  <details className="tree-node-menu">
+                    <summary aria-label="更多節點操作">•••</summary>
+                    <div className="tree-node-popover">
+                      <button type="button" onClick={() => copyText(selectedPath, "已複製 JSONPath")}>複製 JSONPath</button>
+                      <button type="button" onClick={() => copyText(selectedDisplayValue, "已複製節點值")}>複製值</button>
+                      <button type="button" onClick={() => copyText(selectedJson, "已複製節點 JSON")}>複製格式化 JSON</button>
+                    </div>
+                  </details>
                 </div>
                 <div className="tree-view" key={`${treeExpansion}-${treeRevision}`}>
                   <JsonTree value={outputParsed} expansion={treeExpansion} selectedPath={selectedPath} onSelect={setTreeSelection} onContextMenu={(event, selection) => { event.preventDefault(); setTreeSelection(selection); setContextMenu({ ...selection, x: event.clientX, y: event.clientY }); }} />
@@ -611,7 +622,7 @@ export default function Home() {
 
       <footer><span>所有處理與儲存皆在本機完成</span><span>JSON TOOL · v4</span></footer>
       {commandOpen && <div className="modal-backdrop" role="presentation" onMouseDown={() => setCommandOpen(false)}><section className="command-palette" role="dialog" aria-modal="true" aria-label="命令面板" onMouseDown={(event) => event.stopPropagation()}>
-        <div className="command-search"><span>⌘</span><input ref={commandInputRef} value={commandQuery} onChange={(event) => setCommandQuery(event.target.value)} placeholder="搜尋命令…" aria-label="搜尋命令" /></div>
+        <div className="command-search"><span>⌘</span><input ref={commandInputRef} value={commandQuery} onChange={(event) => setCommandQuery(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); document.querySelector<HTMLButtonElement>(".command-list button:not(:disabled)")?.click(); } }} placeholder="搜尋命令…" aria-label="搜尋命令" /></div>
         <div className="command-list">{filteredCommands.length ? filteredCommands.map((command) => <button key={command.label} type="button" data-action={command.action} disabled={command.disabled} onClick={handleCommandClick}><span>{command.label}</span><kbd>{command.hint}</kbd></button>) : <p>找不到符合的命令</p>}</div>
         <div className="command-footer"><span>Enter 執行</span><span>Esc 關閉</span></div>
       </section></div>}
